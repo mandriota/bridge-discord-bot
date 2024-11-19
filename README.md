@@ -5,7 +5,7 @@ configure a bridge between your discord channels
 
 Download and install Go from [go.dev](https://go.dev), then enter the following command in your terminal:
 ```sh
-go install https://github.com/mandriota/bridge-discord-bot@latest
+go install github.com/mandriota/bridge-discord-bot@latest
 ```
 
 You may also need to add `go/bin` directory to `PATH` environment variable.
