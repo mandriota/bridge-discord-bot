@@ -17,3 +17,4 @@ Configuration file looks like:
 }
 ```
 
+Bot token is read from `BRIDGE_BOT_TOKEN` environment variable.
