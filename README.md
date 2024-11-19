@@ -1,6 +1,19 @@
 # bridge-discord-bot
 configure a bridge between your discord channels
 
+## Installation
+
+Download and install Go from [go.dev](https://go.dev), then enter the following command in your terminal:
+```sh
+go install https://github.com/mandriota/bridge-discord-bot.git
+```
+
+You may also need to add `go/bin` directory to `PATH` environment variable.
+Enter the following command in your terminal to find `go/bin` directory:
+```sh
+echo `go env GOPATH`/bin
+```
+
 ## Configuration
 Config location is read in following order:
 1. CLI argument
@@ -18,3 +31,4 @@ Configuration file looks like:
 ```
 
 Bot token is read from `BRIDGE_BOT_TOKEN` environment variable.
+
