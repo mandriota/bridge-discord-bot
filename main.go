@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,7 +12,6 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync/atomic"
 	"syscall"
 
 	"github.com/disgoorg/disgo"
@@ -20,11 +21,15 @@ import (
 	"github.com/disgoorg/disgo/gateway"
 	"github.com/disgoorg/disgo/webhook"
 	"github.com/disgoorg/snowflake/v2"
+	"github.com/huandu/go-sqlbuilder"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type Config map[string][]string
 
 const ForwarderHookName = "ForwarderHook2"
+
+const MaxAttachmentDownloadSize = 1<<15
 
 func loadConfig(cfg *Config, filePath string) error {
 	file, err := os.Open(filePath)
@@ -39,17 +44,72 @@ func loadConfig(cfg *Config, filePath string) error {
 	return nil
 }
 
-type Stats struct {
-	MessageForwardCount uint64
-}
-
 type Handler struct {
-	ctx   context.Context
-	cfg   Config
-	stats Stats
+	ctx context.Context
+	cfg Config
+
+	db *sql.DB
 }
 
-func (h *Handler) getOrCreateWebhook(client bot.Client, channelID snowflake.ID) (*discord.IncomingWebhook, error) {
+func (h *Handler) initDB(filePath string) error {
+	var err error
+	h.db, err = sql.Open("sqlite3", filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open database: %w", err)
+	}
+
+	createMessagesTableQuery, _ := sqlbuilder.CreateTable("messages").
+		IfNotExists().
+		Define("original_channel_id", "TEXT", "NOT NULL").
+		Define("original_message_id", "TEXT", "NOT NULL").
+		Define("hook_channel_id", "TEXT", "NOT NULL").
+		Define("hook_message_id", "TEXT", "NOT NULL").
+		Define("PRIMARY KEY", "(original_channel_id, original_message_id, hook_channel_id, hook_message_id)").
+		BuildWithFlavor(sqlbuilder.SQLite)
+
+	if _, err := h.db.Exec(createMessagesTableQuery); err != nil {
+		return fmt.Errorf("failed to create table: %w", err)
+	}
+	return nil
+}
+
+func (h *Handler) loadRelatedMessageID(targetChannelID, messageRef string) (related string, err error) {
+	selectBL := sqlbuilder.NewSelectBuilder()
+	selectBL.Select(selectBL.As("original_message_id", "related_message_id")).
+		From("messages").
+		Where(
+			selectBL.And(
+				selectBL.Equal("original_channel_id", targetChannelID),
+				selectBL.Equal("hook_message_id", messageRef),
+			),
+		)
+
+	selectBR := sqlbuilder.NewSelectBuilder()
+	selectBR.Select(selectBR.As("hook_message_id", "related_message_id")).
+		From("messages").
+		Where(
+			selectBR.And(
+				selectBR.Equal("hook_channel_id", targetChannelID),
+				selectBR.Equal("original_message_id", messageRef),
+			),
+		)
+
+	query, args := sqlbuilder.Union(selectBL, selectBR).BuildWithFlavor(sqlbuilder.SQLite)
+	return related, h.db.QueryRow(query, args...).Scan(&related)
+}
+
+func (h *Handler) saveMessageMapping(originalChannelID, originalID, hookChannelID, hookID string) error {
+	query, args := sqlbuilder.SQLite.NewInsertBuilder().
+		InsertIgnoreInto("messages").
+		Cols("original_channel_id", "original_message_id", "hook_channel_id", "hook_message_id").
+		Values(originalChannelID, originalID, hookChannelID, hookID).
+		Build()
+
+	_, err := h.db.Exec(query, args...)
+	return err
+}
+
+func (h *Handler) loadOrCreateWebhook(client bot.Client, channelID snowflake.ID) (*discord.IncomingWebhook, error) {
 	webhooks, err := client.Rest().GetWebhooks(channelID)
 	if err != nil {
 		return nil, err
@@ -66,7 +126,7 @@ func (h *Handler) getOrCreateWebhook(client bot.Client, channelID snowflake.ID) 
 	})
 }
 
-func (h *Handler) onMessageCreate(e *events.MessageCreate) {
+func (h *Handler) onMessageCreate(e *events.GuildMessageCreate) {
 	if e.Message.Author.Bot {
 		return
 	}
@@ -76,62 +136,95 @@ func (h *Handler) onMessageCreate(e *events.MessageCreate) {
 		return
 	}
 
-	fmt.Print("\nforwarded messages count: ", atomic.AddUint64(&h.stats.MessageForwardCount, 1))
+	contentCommonFooter := strings.Builder{}
+	contentCommonFileAttach := []uint8{}
+	contentCommonFileBodies := [][]byte{}
 
-	for _, targetChannelID := range targetChannels {
-		targetID, err := snowflake.Parse(targetChannelID)
+	for i, attach := range e.Message.Attachments {
+		if attach.Size > MaxAttachmentDownloadSize {
+			contentCommonFooter.WriteByte('\n')
+			contentCommonFooter.WriteString(attach.URL)
+			continue
+		}
+		
+		resp, err := http.Get(attach.URL)
+		if err != nil {
+			e.Client().Logger().Error("failed to download attachment", "error", err)
+			continue
+		}
+
+		text, err := io.ReadAll(resp.Body)
+		if err != nil {
+			e.Client().Logger().Error("failed to download attachment", "error", err)
+			continue
+		}
+
+		contentCommonFileBodies = append(contentCommonFileBodies, text)
+		contentCommonFileAttach = append(contentCommonFileAttach, uint8(i))
+	}
+
+	for _, targetChannelIDText := range targetChannels {
+		targetChannelID, err := snowflake.Parse(targetChannelIDText)
 		if err != nil {
 			e.Client().Logger().Error("failed to parse channel ID", "error", err)
 			continue
 		}
 
-		forwarderWebhook, err := h.getOrCreateWebhook(e.Client(), targetID)
+		forwarderWebhook, err := h.loadOrCreateWebhook(e.Client(), targetChannelID)
 		if err != nil {
 			e.Client().Logger().Error("failed to get/create webhook", "error", err)
 			continue
 		}
 
 		content := strings.Builder{}
+		if messageRef := e.Message.MessageReference; messageRef != nil {
+			relatedMessageID, err := h.loadRelatedMessageID(targetChannelIDText, messageRef.MessageID.String())
+			if err != nil {
+				e.Client().Logger().Error("failed to fetch hook message ID", "error", err)
+				continue // TODO: write message anyway?
+			}
+
+			content.WriteString("-# in reply to: https://discord.com/channels/")
+			content.WriteString(forwarderWebhook.GuildID.String())
+			content.WriteByte('/')
+			content.WriteString(targetChannelIDText)
+			content.WriteByte('/')
+			content.WriteString(relatedMessageID)
+			content.WriteByte('\n')
+		}
 		content.WriteString(e.Message.Content)
+		content.WriteString(contentCommonFooter.String())
+
+		if content.Len() == 0 && len(contentCommonFileAttach) == 0 {
+			e.Client().Logger().Error("unsupported message")
+			continue
+		}
 
 		messageBuilder := discord.NewWebhookMessageCreateBuilder().
 			SetAvatarURL(*e.Message.Author.AvatarURL()).
-			SetUsername(e.Message.Author.Username)
+			SetUsername(e.Message.Author.Username).
+			SetContent(content.String())
 
-		bodies := []io.ReadCloser{}
-
-		for _, attachment := range e.Message.Attachments {
-			if attachment.Size <= 1<<15 {
-				desc := ""
-				if attachment.Description != nil {
-					desc = *attachment.Description
-				}
-				resp, err := http.Get(attachment.URL)
-				if err != nil {
-					e.Client().Logger().Error("failed to download attachment", "error", err)
-					continue
-				}
-				bodies = append(bodies, resp.Body)
-				messageBuilder.AddFile(attachment.Filename, desc, resp.Body)
-				continue
-			}
-
-			content.WriteByte('\n')
-			content.WriteString(attachment.URL)
+		for i, attachDownloaded := range contentCommonFileAttach {
+			attach := e.Message.Attachments[attachDownloaded]
+			messageBuilder.AddFile(attach.Filename, optionToTypeOrZero(attach.Description), bytes.NewReader(contentCommonFileBodies[i]))
 		}
 
-		messageBuilder.SetContent(content.String())
-
 		forwarderClient := webhook.New(forwarderWebhook.ID(), forwarderWebhook.Token)
-		if _, err := forwarderClient.CreateMessage(messageBuilder.Build()); err != nil {
+		webhookMessage, err := forwarderClient.CreateMessage(messageBuilder.Build())
+		if err != nil {
 			e.Client().Logger().Error("failed to send message via webhook", "error", err)
 		}
 		forwarderClient.Close(h.ctx)
 
-		for _, body := range bodies {
-			body.Close()
+		if err := h.saveMessageMapping(e.Message.ChannelID.String(), e.Message.ID.String(), webhookMessage.ChannelID.String(), webhookMessage.ID.String()); err != nil {
+			e.Client().Logger().Error("failed to save message mapping", "error", err)
 		}
 	}
+}
+
+func (h *Handler) onMessageDelete(e *events.GuildMessageDelete) {
+
 }
 
 func main() {
@@ -151,6 +244,12 @@ func main() {
 		slog.Error("failed to load config", "error", err)
 		return
 	}
+
+	if err := handler.initDB("messages.db"); err != nil {
+		slog.Error("failed to initialize database", "error", err)
+		return
+	}
+	defer handler.db.Close()
 
 	client, err := disgo.New(os.Getenv("BRIDGE_BOT_TOKEN"),
 		bot.WithGatewayConfigOpts(
