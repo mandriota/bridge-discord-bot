@@ -28,7 +28,7 @@ import (
 
 type Config map[string][]string
 
-const ForwarderHookName = "ForwarderHook2"
+const ForwarderHookName = "ForwarderHook"
 
 const MaxAttachmentDownloadSize = 1 << 15
 
@@ -133,7 +133,7 @@ func (h *Handler) loadOrCreateWebhook(client bot.Client, channelID snowflake.ID)
 	}
 
 	for _, webhook := range webhooks {
-		if incomingWebhook, ok := webhook.(discord.IncomingWebhook); ok && webhook.Name() == ForwarderHookName {
+		if incomingWebhook, ok := webhook.(discord.IncomingWebhook); ok && optionToTypeOrZero(incomingWebhook.ApplicationID) == client.ApplicationID() {
 			return &incomingWebhook, nil
 		}
 	}
