@@ -53,8 +53,7 @@ type Handler struct {
 	recentDelCache sync.Map
 }
 
-func (h *Handler) initDB(filePath string) error {
-	var err error
+func (h *Handler) initDB(filePath string) (err error) {
 	h.db, err = sql.Open("sqlite3", filePath)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
