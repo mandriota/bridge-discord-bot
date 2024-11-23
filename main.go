@@ -26,7 +26,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-type Config map[string][]string
+type Config map[snowflake.ID][]snowflake.ID
 
 const ForwarderHookName = "ForwarderHook"
 
@@ -61,10 +61,10 @@ func (h *Handler) initDB(filePath string) (err error) {
 
 	createMessagesTableQuery, _ := sqlbuilder.CreateTable("messages").
 		IfNotExists().
-		Define("original_channel_id", "TEXT", "NOT NULL").
-		Define("original_message_id", "TEXT", "NOT NULL").
-		Define("hook_channel_id", "TEXT", "NOT NULL").
-		Define("hook_message_id", "TEXT", "NOT NULL").
+		Define("original_channel_id", "INT", "NOT NULL").
+		Define("original_message_id", "INT", "NOT NULL").
+		Define("hook_channel_id", "INT", "NOT NULL").
+		Define("hook_message_id", "INT", "NOT NULL").
 		Define("PRIMARY KEY", "(original_channel_id, original_message_id, hook_channel_id, hook_message_id)").
 		BuildWithFlavor(sqlbuilder.SQLite)
 
@@ -74,7 +74,7 @@ func (h *Handler) initDB(filePath string) (err error) {
 	return nil
 }
 
-func (h *Handler) loadRelatedMessageID(targetChannelID, messageRef string) (related string, err error) {
+func (h *Handler) loadRelatedMessageID(targetChannelID, messageRef snowflake.ID) (related snowflake.ID, err error) {
 	selectB := sqlbuilder.NewSelectBuilder()
 	selectB.Select(selectB.As("hook_message_id", "related_message_id")).
 		From("messages").
@@ -89,7 +89,7 @@ func (h *Handler) loadRelatedMessageID(targetChannelID, messageRef string) (rela
 	return related, h.db.QueryRow(query, args...).Scan(&related)
 }
 
-func (h *Handler) loadDirelatedMessageID(targetChannelID, messageRef string) (related string, err error) {
+func (h *Handler) loadDirelatedMessageID(targetChannelID, messageRef snowflake.ID) (related snowflake.ID, err error) {
 	selectBL := sqlbuilder.NewSelectBuilder()
 	selectBL.Select(selectBL.As("original_message_id", "related_message_id")).
 		From("messages").
@@ -114,7 +114,7 @@ func (h *Handler) loadDirelatedMessageID(targetChannelID, messageRef string) (re
 	return related, h.db.QueryRow(query, args...).Scan(&related)
 }
 
-func (h *Handler) saveMessageMapping(originalChannelID, originalID, hookChannelID, hookID string) error {
+func (h *Handler) saveMessageMapping(originalChannelID, originalID, hookChannelID, hookID snowflake.ID) error {
 	query, args := sqlbuilder.SQLite.NewInsertBuilder().
 		InsertIgnoreInto("messages").
 		Cols("original_channel_id", "original_message_id", "hook_channel_id", "hook_message_id").
@@ -142,22 +142,22 @@ func (h *Handler) loadOrCreateWebhook(client bot.Client, channelID snowflake.ID)
 	})
 }
 
-func (h *Handler) tryWriteReferenceHeader(w *strings.Builder, targetGuildIDText, targetChannelIDText string, messageRef *discord.MessageReference) error {
+func (h *Handler) tryWriteReferenceHeader(w *strings.Builder, targetGuildID, targetChannelID snowflake.ID, messageRef *discord.MessageReference) error {
 	if messageRef == nil {
 		return nil
 	}
 
-	relatedMessageID, err := h.loadDirelatedMessageID(targetChannelIDText, messageRef.MessageID.String())
+	relatedMessageID, err := h.loadDirelatedMessageID(targetChannelID, optionToTypeOrZero(messageRef.MessageID))
 	if err != nil {
 		return err
 	}
 
 	w.WriteString("-# in reply to: https://discord.com/channels/")
-	w.WriteString(targetGuildIDText)
+	w.WriteString(targetGuildID.String())
 	w.WriteByte('/')
-	w.WriteString(targetChannelIDText)
+	w.WriteString(targetChannelID.String())
 	w.WriteByte('/')
-	w.WriteString(relatedMessageID)
+	w.WriteString(relatedMessageID.String())
 	w.WriteByte('\n')
 	return nil
 }
@@ -201,20 +201,14 @@ func (h *Handler) onMessageCreate(e *events.GuildMessageCreate) {
 		return
 	}
 
-	targetChannels, ok := h.cfg[e.ChannelID.String()]
+	targetChannels, ok := h.cfg[e.ChannelID]
 	if !ok {
 		return
 	}
 
 	contentCommonFooter, contentCommonFileAttach, contentCommonFileBodies := h.processMessageAttachments(e.GenericGuildMessage, false)
 
-	for _, targetChannelIDText := range targetChannels {
-		targetChannelID, err := snowflake.Parse(targetChannelIDText)
-		if err != nil {
-			e.Client().Logger().Error("failed to parse channel ID", "error", err)
-			continue
-		}
-
+	for _, targetChannelID := range targetChannels {
 		forwarderWebhook, err := h.loadOrCreateWebhook(e.Client(), targetChannelID)
 		if err != nil {
 			e.Client().Logger().Error("failed to get/create webhook", "error", err)
@@ -222,7 +216,7 @@ func (h *Handler) onMessageCreate(e *events.GuildMessageCreate) {
 		}
 
 		content := &strings.Builder{}
-		if err := h.tryWriteReferenceHeader(content, forwarderWebhook.GuildID.String(), targetChannelIDText, e.Message.MessageReference); err != nil {
+		if err := h.tryWriteReferenceHeader(content, forwarderWebhook.GuildID, targetChannelID, e.Message.MessageReference); err != nil {
 			e.Client().Logger().Error("failed to fetch hook message ID", "error", err)
 		}
 		content.WriteString(e.Message.Content)
@@ -251,7 +245,7 @@ func (h *Handler) onMessageCreate(e *events.GuildMessageCreate) {
 		}
 		forwarderClient.Close(h.ctx)
 
-		if err := h.saveMessageMapping(e.Message.ChannelID.String(), e.MessageID.String(), webhookMessage.ChannelID.String(), webhookMessage.ID.String()); err != nil {
+		if err := h.saveMessageMapping(e.Message.ChannelID, e.MessageID, webhookMessage.ChannelID, webhookMessage.ID); err != nil {
 			e.Client().Logger().Error("failed to save message mapping", "error", err)
 		}
 	}
@@ -262,28 +256,28 @@ func (h *Handler) onMessageUpdate(e *events.GuildMessageUpdate) {
 		return
 	}
 
-	targetChannels, ok := h.cfg[e.ChannelID.String()]
+	targetChannels, ok := h.cfg[e.ChannelID]
 	if !ok {
 		return
 	}
 
 	contentCommonFooter, _, _ := h.processMessageAttachments(e.GenericGuildMessage, true)
 
-	for _, targetChannelIDText := range targetChannels {
-		relatedMessageIDText, err := h.loadRelatedMessageID(targetChannelIDText, e.Message.ID.String())
+	for _, targetChannelID := range targetChannels {
+		relatedMessageID, err := h.loadRelatedMessageID(targetChannelID, e.MessageID)
 		if err != nil {
 			e.Client().Logger().Error("failed to fetch related message ID for update", "error", err)
 			continue
 		}
 
-		forwarderWebhook, err := h.loadOrCreateWebhook(e.Client(), snowflake.MustParse(targetChannelIDText))
+		forwarderWebhook, err := h.loadOrCreateWebhook(e.Client(), targetChannelID)
 		if err != nil {
 			e.Client().Logger().Error("failed to load or create webhook", "error", err)
 			continue
 		}
 
 		content := &strings.Builder{}
-		if err := h.tryWriteReferenceHeader(content, forwarderWebhook.GuildID.String(), targetChannelIDText, e.Message.MessageReference); err != nil {
+		if err := h.tryWriteReferenceHeader(content, forwarderWebhook.GuildID, targetChannelID, e.Message.MessageReference); err != nil {
 			e.Client().Logger().Error("failed to fetch hook message ID", "error", err)
 		}
 		content.WriteString(e.Message.Content)
@@ -294,7 +288,6 @@ func (h *Handler) onMessageUpdate(e *events.GuildMessageUpdate) {
 
 		forwarderClient := webhook.New(forwarderWebhook.ID(), forwarderWebhook.Token)
 
-		relatedMessageID := snowflake.MustParse(relatedMessageIDText)
 		if _, err := forwarderClient.UpdateMessage(relatedMessageID, messageBuilder.Build()); err != nil {
 			e.Client().Logger().Error("failed to update forwarded message via webhook", "error", err)
 		}
@@ -312,19 +305,19 @@ func (h *Handler) onMessageDelete(e *events.GuildMessageDelete) {
 		return
 	}
 
-	targetChannels, ok := h.cfg[e.ChannelID.String()]
+	targetChannels, ok := h.cfg[e.ChannelID]
 	if !ok {
 		return
 	}
 
-	for _, targetChannelIDText := range targetChannels {
-		relatedMessageIDText, err := h.loadRelatedMessageID(targetChannelIDText, e.MessageID.String())
+	for _, targetChannelID := range targetChannels {
+		relatedMessageID, err := h.loadRelatedMessageID(targetChannelID, e.MessageID)
 		if err != nil {
 			e.Client().Logger().Error("failed to fetch related message ID for deletion", "error", err)
 			continue
 		}
 
-		forwarderWebhook, err := h.loadOrCreateWebhook(e.Client(), snowflake.MustParse(targetChannelIDText))
+		forwarderWebhook, err := h.loadOrCreateWebhook(e.Client(), targetChannelID)
 		if err != nil {
 			e.Client().Logger().Error("failed to load or create webhook", "error", err)
 			continue
@@ -332,7 +325,6 @@ func (h *Handler) onMessageDelete(e *events.GuildMessageDelete) {
 
 		forwarderClient := webhook.New(forwarderWebhook.ID(), forwarderWebhook.Token)
 
-		relatedMessageID := snowflake.MustParse(relatedMessageIDText)
 		if err := forwarderClient.DeleteMessage(relatedMessageID); err != nil {
 			e.Client().Logger().Error("failed to delete forwarded message via webhook", "error", err)
 		} else {
