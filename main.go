@@ -235,7 +235,7 @@ func (h *Handler) onMessageCreate(e *events.GuildMessageCreate) {
 
 		messageBuilder := discord.NewWebhookMessageCreateBuilder().
 			SetAllowedMentions(&discord.AllowedMentions{}).
-			SetAvatarURL(*e.Message.Author.AvatarURL()).
+			SetAvatarURL(optionToTypeOrZero(e.Message.Author.AvatarURL())).
 			SetUsername(e.Message.Author.Username).
 			SetContent(content.String())
 
