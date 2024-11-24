@@ -30,7 +30,7 @@ type Config map[snowflake.ID][]snowflake.ID
 
 const ForwarderHookName = "ForwarderHook"
 
-const MaxAttachmentDownloadSize = 1 << 15
+const MaxAttachmentDownloadSize = (1 << 20) * 10
 
 func loadConfig(cfg *Config, filePath string) error {
 	file, err := os.Open(filePath)
@@ -364,6 +364,7 @@ func main() {
 			gateway.WithIntents(
 				gateway.IntentGuilds,
 				gateway.IntentGuildMessages,
+				gateway.IntentGuildExpressions,
 				gateway.IntentMessageContent,
 			),
 		),
