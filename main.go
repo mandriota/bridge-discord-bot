@@ -14,12 +14,14 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"unicode"
 
 	"github.com/disgoorg/disgo"
 	"github.com/disgoorg/disgo/bot"
 	"github.com/disgoorg/disgo/discord"
 	"github.com/disgoorg/disgo/events"
 	"github.com/disgoorg/disgo/gateway"
+	"github.com/disgoorg/disgo/rest"
 	"github.com/disgoorg/disgo/webhook"
 	"github.com/disgoorg/snowflake/v2"
 	"github.com/huandu/go-sqlbuilder"
@@ -49,6 +51,7 @@ type Handler struct {
 	ctx context.Context
 	cfg Config
 
+	rest           rest.Rest
 	db             *sql.DB
 	recentDelCache sync.Map
 }
@@ -147,17 +150,38 @@ func (h *Handler) tryWriteReferenceHeader(w *strings.Builder, targetGuildID, tar
 		return nil
 	}
 
-	relatedMessageID, err := h.loadDirelatedMessageID(targetChannelID, optionToTypeOrZero(messageRef.MessageID))
+	msgRefID := optionToTypeOrZero(messageRef.MessageID)
+
+	relatedMessageID, err := h.loadDirelatedMessageID(targetChannelID, msgRefID)
 	if err != nil {
 		return err
 	}
 
-	w.WriteString("-# in reply to: https://discord.com/channels/")
+	refMsg, err := h.rest.GetMessage(optionToTypeOrZero(messageRef.ChannelID), msgRefID)
+	if err != nil {
+		return err
+	}
+
+	replyPreview := refMsg.Content[skipPrefixedLine(refMsg.Content, "-#"):]
+	cutIndicator := ""
+	replyPreviewLimit := nthRune(replyPreview, 128)
+	if replyPreviewLimit < len(replyPreview) {
+		cutIndicator = " <...>"
+		replyPreview = replyPreview[:replyPreviewLimit]
+	}
+	replyPreview = strings.TrimRightFunc(replyPreview, func (r rune) bool {
+		return unicode.IsSpace(r)
+	})
+
+	w.WriteString("-# https://discord.com/channels/")
 	w.WriteString(targetGuildID.String())
 	w.WriteByte('/')
 	w.WriteString(targetChannelID.String())
 	w.WriteByte('/')
 	w.WriteString(relatedMessageID.String())
+	w.WriteString(" ---\n-# > ")
+	w.WriteString(replyPreview)
+	w.WriteString(cutIndicator)
 	w.WriteByte('\n')
 	return nil
 }
@@ -377,6 +401,8 @@ func main() {
 		return
 	}
 	defer client.Close(ctx)
+
+	handler.rest = client.Rest()
 
 	slog.Info("opening gateway...")
 
