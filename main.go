@@ -168,10 +168,13 @@ func (h *Handler) tryWriteReferenceHeader(w *strings.Builder, targetGuildID, tar
 	if replyPreviewLimit < len(replyPreview) {
 		cutIndicator = " <...>"
 		replyPreview = replyPreview[:replyPreviewLimit]
+
+		lastSpace := strings.LastIndexFunc(replyPreview, unicode.IsSpace)
+		if lastSpace > 0 {
+			replyPreview = replyPreview[:lastSpace]
+		}
 	}
-	replyPreview = strings.TrimRightFunc(replyPreview, func (r rune) bool {
-		return unicode.IsSpace(r)
-	})
+	replyPreview = strings.TrimRightFunc(replyPreview, unicode.IsSpace)
 
 	w.WriteString("-# https://discord.com/channels/")
 	w.WriteString(targetGuildID.String())
@@ -179,10 +182,12 @@ func (h *Handler) tryWriteReferenceHeader(w *strings.Builder, targetGuildID, tar
 	w.WriteString(targetChannelID.String())
 	w.WriteByte('/')
 	w.WriteString(relatedMessageID.String())
-	w.WriteString(" ---\n-# > ")
+	w.WriteString(" © ")
+	w.WriteString(refMsg.Author.Username)
+	w.WriteString("\n-# > ")
 	w.WriteString(replyPreview)
 	w.WriteString(cutIndicator)
-	w.WriteByte('\n')
+	w.WriteString("\n-# ---\n")
 	return nil
 }
 

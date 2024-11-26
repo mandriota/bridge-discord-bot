@@ -32,15 +32,15 @@ func skipPrefixedLine(s, prefix string) int {
 	return i
 }
 
-func nthRune(s string, n int) int {
+func nthRune(s string, n int) (i int) {
 	runeCount := 0
 	
-	for i := range s {
+	for i = range s {
 		if runeCount == n {
 			return i
 		}
 		runeCount++
 	}
 
-	return -1
+	return i
 }
