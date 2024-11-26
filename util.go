@@ -26,7 +26,7 @@ func skipPrefixedLine(s, prefix string) int {
 	i := 0
 
 	for strings.HasPrefix(s[i:], prefix) {
-		i = skipLine(s)
+		i += skipLine(s[i:])
 	}
 
 	return i

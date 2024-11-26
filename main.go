@@ -62,6 +62,12 @@ func (h *Handler) initDB(filePath string) (err error) {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
 
+	tx, err := h.db.BeginTx(h.ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
 	createMessagesTableQuery, _ := sqlbuilder.CreateTable("messages").
 		IfNotExists().
 		Define("original_channel_id", "INT", "NOT NULL").
@@ -71,10 +77,21 @@ func (h *Handler) initDB(filePath string) (err error) {
 		Define("PRIMARY KEY", "(original_channel_id, original_message_id, hook_channel_id, hook_message_id)").
 		BuildWithFlavor(sqlbuilder.SQLite)
 
-	if _, err := h.db.Exec(createMessagesTableQuery); err != nil {
+	if _, err := tx.ExecContext(h.ctx, createMessagesTableQuery); err != nil {
 		return fmt.Errorf("failed to create table: %w", err)
 	}
-	return nil
+
+	createAuthorsTableQuery, _ := sqlbuilder.CreateTable("authors").
+		IfNotExists().
+		Define("username", "TEXT", "NOT NULL").
+		Define("id", "INT", "NOT NULL").
+		Define("PRIMARY KEY", "(username, id)").
+		BuildWithFlavor(sqlbuilder.SQLite)
+
+	if _, err := tx.ExecContext(h.ctx, createAuthorsTableQuery); err != nil {
+		return fmt.Errorf("failed to create table: %w", err)
+	}
+	return tx.Commit()
 }
 
 func (h *Handler) loadRelatedMessageID(targetChannelID, messageRef snowflake.ID) (related snowflake.ID, err error) {
@@ -117,14 +134,35 @@ func (h *Handler) loadDirelatedMessageID(targetChannelID, messageRef snowflake.I
 	return related, h.db.QueryRow(query, args...).Scan(&related)
 }
 
-func (h *Handler) saveMessageMapping(originalChannelID, originalID, hookChannelID, hookID snowflake.ID) error {
+func (h *Handler) saveMessageMapping(tx *sql.Tx, originalChannelID, originalID, hookChannelID, hookID snowflake.ID) error {
 	query, args := sqlbuilder.SQLite.NewInsertBuilder().
 		InsertIgnoreInto("messages").
 		Cols("original_channel_id", "original_message_id", "hook_channel_id", "hook_message_id").
 		Values(originalChannelID, originalID, hookChannelID, hookID).
 		Build()
 
-	_, err := h.db.Exec(query, args...)
+	_, err := tx.ExecContext(h.ctx, query, args...)
+	return err
+}
+
+func (h *Handler) loadAuthorID(username string) (id snowflake.ID, err error) {
+	selectB := sqlbuilder.SQLite.NewSelectBuilder()
+	query, args := selectB.Select("id").
+		From("authors").
+		Where(selectB.Equal("username", username)).
+		Build()
+	
+	return id, h.db.QueryRow(query, args...).Scan(&id)
+}
+
+func (h *Handler) saveAuthorMapping(tx *sql.Tx, username string, id snowflake.ID) error {
+	query, args := sqlbuilder.SQLite.NewInsertBuilder().
+		InsertIgnoreInto("authors").
+		Cols("username", "id").
+		Values(username, id).
+		Build()
+
+	_, err := tx.ExecContext(h.ctx, query, args...)
 	return err
 }
 
@@ -145,49 +183,55 @@ func (h *Handler) loadOrCreateWebhook(client bot.Client, channelID snowflake.ID)
 	})
 }
 
-func (h *Handler) tryWriteReferenceHeader(w *strings.Builder, targetGuildID, targetChannelID snowflake.ID, messageRef *discord.MessageReference) error {
-	if messageRef == nil {
+func (h *Handler) tryWriteReferenceHeader(w *strings.Builder, targetGuildID, targetChannelID snowflake.ID, msgRef *discord.MessageReference) error {
+	if msgRef == nil {
 		return nil
 	}
 
-	msgRefID := optionToTypeOrZero(messageRef.MessageID)
+	referredMsgID := optionToTypeOrZero(msgRef.MessageID)
 
-	relatedMessageID, err := h.loadDirelatedMessageID(targetChannelID, msgRefID)
+	relatedMsgID, err := h.loadDirelatedMessageID(targetChannelID, referredMsgID)
 	if err != nil {
 		return err
 	}
 
-	refMsg, err := h.rest.GetMessage(optionToTypeOrZero(messageRef.ChannelID), msgRefID)
+	referredMsg, err := h.rest.GetMessage(optionToTypeOrZero(msgRef.ChannelID), referredMsgID)
 	if err != nil {
 		return err
 	}
 
-	replyPreview := refMsg.Content[skipPrefixedLine(refMsg.Content, "-#"):]
+	referredMsgAuthorID, err := h.loadAuthorID(referredMsg.Author.Username)
+	if err != nil {
+		return err
+	}
+
+	referredMsgPreview := referredMsg.Content[skipPrefixedLine(referredMsg.Content, "-#"):]
 	cutIndicator := ""
-	replyPreviewLimit := nthRune(replyPreview, 128)
-	if replyPreviewLimit < len(replyPreview) {
+	referredMsgPreviewWindow := nthRune(referredMsgPreview, 128)
+	if referredMsgPreviewWindow < len(referredMsgPreview) {
 		cutIndicator = " <...>"
-		replyPreview = replyPreview[:replyPreviewLimit]
+		referredMsgPreview = referredMsgPreview[:referredMsgPreviewWindow]
 
-		lastSpace := strings.LastIndexFunc(replyPreview, unicode.IsSpace)
+		lastSpace := strings.LastIndexFunc(referredMsgPreview, unicode.IsSpace)
 		if lastSpace > 0 {
-			replyPreview = replyPreview[:lastSpace]
+			referredMsgPreview = referredMsgPreview[:lastSpace]
 		}
 	}
-	replyPreview = strings.TrimRightFunc(replyPreview, unicode.IsSpace)
+	referredMsgPreview = strings.TrimRightFunc(referredMsgPreview, unicode.IsSpace)
 
 	w.WriteString("-# https://discord.com/channels/")
 	w.WriteString(targetGuildID.String())
 	w.WriteByte('/')
 	w.WriteString(targetChannelID.String())
 	w.WriteByte('/')
-	w.WriteString(relatedMessageID.String())
+	w.WriteString(relatedMsgID.String())
 	w.WriteString(" (<@")
-	w.WriteString(refMsg.Author.ID.String())
+	w.WriteString(referredMsgAuthorID.String())
 	w.WriteString(">)\n-# > ")
-	w.WriteString(replyPreview)
+	w.WriteString(referredMsgPreview)
 	w.WriteString(cutIndicator)
 	w.WriteString("\n-# ---\n")
+
 	return nil
 }
 
@@ -235,6 +279,17 @@ func (h *Handler) onMessageCreate(e *events.GuildMessageCreate) {
 		return
 	}
 
+	tx, err := h.db.BeginTx(h.ctx, nil)
+	if err != nil {
+		e.Client().Logger().Error("failed to begin transaction", "error", err)
+		return
+	}
+	defer tx.Rollback()
+
+	if err := h.saveAuthorMapping(tx, e.Message.Author.Username, e.Message.Author.ID); err != nil {
+		e.Client().Logger().Error("failed to save author mapping", "error", err)
+	}
+
 	contentCommonFooter, contentCommonFileAttach, contentCommonFileBodies := h.processMessageAttachments(e.GenericGuildMessage, false)
 
 	for _, targetChannelID := range targetChannels {
@@ -258,9 +313,14 @@ func (h *Handler) onMessageCreate(e *events.GuildMessageCreate) {
 
 		messageBuilder := discord.NewWebhookMessageCreateBuilder().
 			SetAllowedMentions(&discord.AllowedMentions{}).
-			SetAvatarURL(optionToTypeOrZero(e.Message.Author.AvatarURL())).
 			SetUsername(e.Message.Author.Username).
 			SetContent(content.String())
+
+		if url := e.Message.Author.AvatarURL(); url != nil {
+			messageBuilder.SetAvatarURL(*url)
+		} else {
+			messageBuilder.SetAvatarURL(fmt.Sprintf("%s/embed/avatars/%d.png", discord.CDN, e.Message.Author.ID))
+		}
 
 		for i, attachDownloaded := range contentCommonFileAttach {
 			attach := e.Message.Attachments[attachDownloaded]
@@ -274,9 +334,14 @@ func (h *Handler) onMessageCreate(e *events.GuildMessageCreate) {
 		}
 		forwarderClient.Close(h.ctx)
 
-		if err := h.saveMessageMapping(e.Message.ChannelID, e.MessageID, webhookMessage.ChannelID, webhookMessage.ID); err != nil {
+		if err := h.saveMessageMapping(tx, e.Message.ChannelID, e.MessageID, webhookMessage.ChannelID, webhookMessage.ID); err != nil {
 			e.Client().Logger().Error("failed to save message mapping", "error", err)
 		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		e.Client().Logger().Error("failed to commit transaction", "error", err)
+		return
 	}
 }
 
