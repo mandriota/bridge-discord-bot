@@ -3,8 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
-	"encoding/json"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -23,33 +24,17 @@ import (
 	"github.com/disgoorg/disgo/gateway"
 	"github.com/disgoorg/disgo/rest"
 	"github.com/disgoorg/disgo/webhook"
+	"github.com/disgoorg/json"
 	"github.com/disgoorg/snowflake/v2"
-	"github.com/huandu/go-sqlbuilder"
 	_ "github.com/mattn/go-sqlite3"
 )
-
-type Config map[snowflake.ID][]snowflake.ID
 
 const ForwarderHookName = "ForwarderHook"
 
 const MaxAttachmentDownloadSize = (1 << 20) * 10
 
-func loadConfig(cfg *Config, filePath string) error {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	if err := json.NewDecoder(file).Decode(cfg); err != nil {
-		return err
-	}
-	return nil
-}
-
 type Handler struct {
 	ctx context.Context
-	cfg Config
 
 	rest           rest.Rest
 	db             *sql.DB
@@ -68,101 +53,61 @@ func (h *Handler) initDB(filePath string) (err error) {
 	}
 	defer tx.Rollback()
 
-	createMessagesTableQuery, _ := sqlbuilder.CreateTable("messages").
-		IfNotExists().
-		Define("original_channel_id", "INT", "NOT NULL").
-		Define("original_message_id", "INT", "NOT NULL").
-		Define("hook_channel_id", "INT", "NOT NULL").
-		Define("hook_message_id", "INT", "NOT NULL").
-		Define("PRIMARY KEY", "(original_channel_id, original_message_id, hook_channel_id, hook_message_id)").
-		BuildWithFlavor(sqlbuilder.SQLite)
-
-	if _, err := tx.ExecContext(h.ctx, createMessagesTableQuery); err != nil {
+	if err := createMessagesTable(h.ctx, tx); err != nil {
 		return fmt.Errorf("failed to create table: %w", err)
 	}
 
-	createAuthorsTableQuery, _ := sqlbuilder.CreateTable("authors").
-		IfNotExists().
-		Define("username", "TEXT", "NOT NULL").
-		Define("id", "INT", "NOT NULL").
-		Define("PRIMARY KEY", "(username, id)").
-		BuildWithFlavor(sqlbuilder.SQLite)
+	if err := createAuthorsTable(h.ctx, tx); err != nil {
+		return fmt.Errorf("failed to create table: %w", err)
+	}
 
-	if _, err := tx.ExecContext(h.ctx, createAuthorsTableQuery); err != nil {
+	if err := createLinksTable(h.ctx, tx); err != nil {
 		return fmt.Errorf("failed to create table: %w", err)
 	}
 	return tx.Commit()
 }
 
-func (h *Handler) loadRelatedMessageID(targetChannelID, messageRef snowflake.ID) (related snowflake.ID, err error) {
-	selectB := sqlbuilder.NewSelectBuilder()
-	selectB.Select(selectB.As("hook_message_id", "related_message_id")).
-		From("messages").
-		Where(
-			selectB.And(
-				selectB.Equal("hook_channel_id", targetChannelID),
-				selectB.Equal("original_message_id", messageRef),
-			),
-		)
+func (h *Handler) initCommands(appID snowflake.ID) error {
+	commands := []discord.ApplicationCommandCreate{
+		discord.SlashCommandCreate{
+			Name:        "link",
+			Description: "links current channel to virtual channel",
+			Options: []discord.ApplicationCommandOption{
+				discord.ApplicationCommandOptionString{
+					Name:        "virtual_channel_key",
+					Description: "virtual channel key to link to",
+					Required:    true,
+				},
+				discord.ApplicationCommandOptionString{
+					Name:        "note",
+					Description: "note about virtual channel",
+				},
+			},
+			DefaultMemberPermissions: json.NewNullablePtr(discord.PermissionManageChannels),
+			Contexts: []discord.InteractionContextType{discord.InteractionContextTypeGuild},
+		},
+		discord.SlashCommandCreate{
+			Name:        "unlink",
+			Description: "unlinks current channel from virtual channel",
+			Options: []discord.ApplicationCommandOption{
+				discord.ApplicationCommandOptionString{
+					Name:        "virtual_channel_key",
+					Description: "virtual channel key to unlink from",
+					Required:    true,
+				},
+			},
+		},
+		discord.SlashCommandCreate{
+			Name:        "unlink_all",
+			Description: "unlinks current channel from all virtual channels",
+		},
+		discord.SlashCommandCreate{
+			Name:        "list",
+			Description: "list virtual channels linked to current channel",
+		},
+	}
 
-	query, args := selectB.BuildWithFlavor(sqlbuilder.SQLite)
-	return related, h.db.QueryRow(query, args...).Scan(&related)
-}
-
-func (h *Handler) loadDirelatedMessageID(targetChannelID, messageRef snowflake.ID) (related snowflake.ID, err error) {
-	selectBL := sqlbuilder.NewSelectBuilder()
-	selectBL.Select(selectBL.As("original_message_id", "related_message_id")).
-		From("messages").
-		Where(
-			selectBL.And(
-				selectBL.Equal("original_channel_id", targetChannelID),
-				selectBL.Equal("hook_message_id", messageRef),
-			),
-		)
-
-	selectBR := sqlbuilder.NewSelectBuilder()
-	selectBR.Select(selectBR.As("hook_message_id", "related_message_id")).
-		From("messages").
-		Where(
-			selectBR.And(
-				selectBR.Equal("hook_channel_id", targetChannelID),
-				selectBR.Equal("original_message_id", messageRef),
-			),
-		)
-
-	query, args := sqlbuilder.Union(selectBL, selectBR).BuildWithFlavor(sqlbuilder.SQLite)
-	return related, h.db.QueryRow(query, args...).Scan(&related)
-}
-
-func (h *Handler) saveMessageMapping(tx *sql.Tx, originalChannelID, originalID, hookChannelID, hookID snowflake.ID) error {
-	query, args := sqlbuilder.SQLite.NewInsertBuilder().
-		InsertIgnoreInto("messages").
-		Cols("original_channel_id", "original_message_id", "hook_channel_id", "hook_message_id").
-		Values(originalChannelID, originalID, hookChannelID, hookID).
-		Build()
-
-	_, err := tx.ExecContext(h.ctx, query, args...)
-	return err
-}
-
-func (h *Handler) loadAuthorID(username string) (id snowflake.ID, err error) {
-	selectB := sqlbuilder.SQLite.NewSelectBuilder()
-	query, args := selectB.Select("id").
-		From("authors").
-		Where(selectB.Equal("username", username)).
-		Build()
-	
-	return id, h.db.QueryRow(query, args...).Scan(&id)
-}
-
-func (h *Handler) saveAuthorMapping(tx *sql.Tx, username string, id snowflake.ID) error {
-	query, args := sqlbuilder.SQLite.NewInsertBuilder().
-		InsertIgnoreInto("authors").
-		Cols("username", "id").
-		Values(username, id).
-		Build()
-
-	_, err := tx.ExecContext(h.ctx, query, args...)
+	_, err := h.rest.SetGlobalCommands(appID, commands)
 	return err
 }
 
@@ -188,7 +133,7 @@ func (h *Handler) tryWriteReferenceHeader(w *strings.Builder, targetGuildID, tar
 		return nil
 	}
 
-	relatedMsgID, err := h.loadDirelatedMessageID(targetChannelID, *msgRef.MessageID)
+	relatedMsgID, err := loadDirelatedMessageID(h.ctx, h.db, targetChannelID, *msgRef.MessageID)
 	if err != nil {
 		return err
 	}
@@ -198,7 +143,7 @@ func (h *Handler) tryWriteReferenceHeader(w *strings.Builder, targetGuildID, tar
 		return err
 	}
 
-	referredMsgAuthorID, err := h.loadAuthorID(referredMsg.Author.Username)
+	referredMsgAuthorID, err := loadAuthorID(h.ctx, h.db, referredMsg.Author.Username)
 	if err != nil {
 		return err
 	}
@@ -267,13 +212,214 @@ func (h *Handler) processMessageAttachments(e *events.GenericGuildMessage, onlyF
 	return contentCommonFooter.String(), contentCommonFileAttach, contentCommonFileBodies
 }
 
+func (h *Handler) onCommandInteractionCreateLink(e *events.ApplicationCommandInteractionCreate, commandData discord.SlashCommandInteractionData) {
+	virtualChannelKey := commandData.String("virtual_channel_key")
+	note := commandData.String("note")
+
+	hash := sha256.Sum256([]byte(virtualChannelKey))
+	virtualChannelHash := hex.EncodeToString(hash[:])
+
+	query, args := buildInsertLinkQuery(virtualChannelHash, e.Channel().ID(), note)
+	_, err := h.db.Exec(query, args...)
+	if err != nil {
+		e.Client().Logger().Error("failed to link channel to virtual channel key", "error", err)
+		err := e.CreateMessage(discord.NewMessageCreateBuilder().
+			SetEmbeds(discord.Embed{
+				Title:       "Error",
+				Description: "Could not link the channel.",
+				Color:       0xFF0000,
+			}).
+			SetEphemeral(true).
+			Build(),
+		)
+		if err != nil {
+			e.Client().Logger().Error("error sending response", "error", err)
+		}
+		return
+	}
+
+	if err := e.CreateMessage(discord.NewMessageCreateBuilder().
+		SetContent(fmt.Sprintf("Channel successfully linked to virtual channel `%s`.", virtualChannelHash)).
+		SetEphemeral(true).
+		Build(),
+	); err != nil {
+		e.Client().Logger().Error("error sending response", "error", err)
+	}
+}
+
+func (h *Handler) onCommandInteractionCreateUnlink(e *events.ApplicationCommandInteractionCreate, commandData discord.SlashCommandInteractionData) {
+	virtualChannelKey := commandData.String("virtual_channel_key")
+
+	query, args := buildDeleteLinkQuery(virtualChannelKey, e.Channel().ID())
+	res, err := h.db.Exec(query, args...)
+	if err != nil {
+		e.Client().Logger().Error("failed to unlink channel from virtual channel key", "error", err)
+		e.CreateMessage(discord.NewMessageCreateBuilder().
+			SetEmbeds(discord.Embed{
+				Title:       "Error",
+				Description: "Could not unlink the channel.",
+				Color:       0xFF0000,
+			}).
+			SetEphemeral(true).
+			Build(),
+		)
+		return
+	}
+
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 0 {
+		e.CreateMessage(discord.NewMessageCreateBuilder().
+			SetEmbeds(discord.Embed{
+				Title:       "Error",
+				Description: fmt.Sprintf("No link found for virtual channel key `%s`.", virtualChannelKey),
+				Color:       0xFF0000,
+			}).
+			SetEphemeral(true).
+			Build(),
+		)
+		return
+	}
+
+	e.CreateMessage(discord.NewMessageCreateBuilder().
+		SetEmbeds(discord.Embed{
+			Title:       "Success",
+			Description: fmt.Sprintf("Channel successfully unlinked from virtual channel key `%s`.", virtualChannelKey),
+			Color:       0x00FF00,
+		}).
+		SetEphemeral(true).
+		Build(),
+	)
+}
+
+func (h *Handler) onCommandInteractionCreateUnlinkAll(e *events.ApplicationCommandInteractionCreate, _ discord.SlashCommandInteractionData) {
+	query, args := buildDeleteAllLinksQuery(e.Channel().ID())
+
+	res, err := h.db.Exec(query, args...)
+	if err != nil {
+		e.Client().Logger().Error("failed to unlink all virtual channels for the channel", "error", err)
+		e.CreateMessage(discord.NewMessageCreateBuilder().
+			SetEmbeds(discord.Embed{
+				Title:       "Error",
+				Description: "Could not unlink all virtual channels.",
+				Color:       0xFF0000,
+			}).
+			SetEphemeral(true).
+			Build(),
+		)
+		return
+	}
+
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 0 {
+		e.CreateMessage(discord.NewMessageCreateBuilder().
+			SetEmbeds(discord.Embed{
+				Title:       "No Links Found",
+				Description: "No links found for this channel.",
+				Color:       0xFF0000,
+			}).
+			SetEphemeral(true).
+			Build(),
+		)
+		return
+	}
+
+	e.CreateMessage(discord.NewMessageCreateBuilder().
+		SetEmbeds(discord.Embed{
+			Title:       "Success",
+			Description: fmt.Sprintf("Successfully unlinked %d virtual channel(s) from this channel.", rowsAffected),
+			Color:       0x00FF00,
+		}).
+		SetEphemeral(true).
+		Build(),
+	)
+}
+
+func (h *Handler) onCommandInteractionCreateList(e *events.ApplicationCommandInteractionCreate, _ discord.SlashCommandInteractionData) {
+	query, args := buildSelectVirtualChannelKeyQuery(e.Channel().ID())
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		e.Client().Logger().Error("failed to list virtual channels for the channel", "error", err)
+		e.CreateMessage(discord.NewMessageCreateBuilder().
+			SetEmbeds(discord.Embed{
+				Title:       "Error",
+				Description: "Could not retrieve the list of virtual channels.",
+				Color:       0xFF0000,
+			}).
+			SetEphemeral(true).
+			Build(),
+		)
+		return
+	}
+	defer rows.Close()
+
+	virtualChannelKey := ""
+	note := ""
+
+	sb := strings.Builder{}
+	for rows.Next() {
+		if err := rows.Scan(&virtualChannelKey, &note); err != nil {
+			e.Client().Logger().Error("failed to scan virtual channel key", "error", err)
+			continue
+		}
+		sb.WriteString("- `")
+		sb.WriteString(virtualChannelKey)
+		sb.WriteByte('`')
+		if note != "" {
+			sb.WriteString(" (note: ")
+			sb.WriteString(note)
+			sb.WriteByte(')')
+		}
+		sb.WriteByte('\n')
+	}
+
+	if sb.Len() == 0 {
+		e.CreateMessage(discord.NewMessageCreateBuilder().
+			SetEmbeds(discord.Embed{
+				Title:       "No Virtual Channels Linked",
+				Description: "No virtual channels are linked to this channel.",
+				Color:       0xFF0000,
+			}).
+			SetEphemeral(true).
+			Build(),
+		)
+		return
+	}
+
+	e.CreateMessage(discord.NewMessageCreateBuilder().
+		SetEmbeds(discord.Embed{
+			Title:       "Virtual Channels Linked",
+			Description: fmt.Sprintf("Virtual channels linked to this channel:\n%s", sb.String()),
+			Color:       0x00FF00,
+		}).
+		SetEphemeral(true).
+		Build(),
+	)
+}
+
+func (h *Handler) onCommandInteractionCreate(e *events.ApplicationCommandInteractionCreate) {
+	commandData := e.SlashCommandInteractionData()
+
+	switch commandData.CommandName() {
+	case "link":
+		h.onCommandInteractionCreateLink(e, commandData)
+	case "unlink":
+		h.onCommandInteractionCreateUnlink(e, commandData)
+	case "unlink_all":
+		h.onCommandInteractionCreateUnlinkAll(e, commandData)
+	case "list":
+		h.onCommandInteractionCreateList(e, commandData)
+	}
+}
+
 func (h *Handler) onMessageCreate(e *events.GuildMessageCreate) {
 	if e.Message.Author.Bot {
 		return
 	}
 
-	targetChannels, ok := h.cfg[e.ChannelID]
-	if !ok {
+	targetChannels, err := loadRelatedChannels(h.ctx, h.db, e.ChannelID)
+	if err != nil {
+		e.Client().Logger().Error("failed to load related channels", "error", err)
 		return
 	}
 
@@ -284,7 +430,7 @@ func (h *Handler) onMessageCreate(e *events.GuildMessageCreate) {
 	}
 	defer tx.Rollback()
 
-	if err := h.saveAuthorMapping(tx, e.Message.Author.Username, e.Message.Author.ID); err != nil {
+	if err := saveAuthorMapping(h.ctx, tx, e.Message.Author.Username, e.Message.Author.ID); err != nil {
 		e.Client().Logger().Error("failed to save author mapping", "error", err)
 	}
 
@@ -332,7 +478,7 @@ func (h *Handler) onMessageCreate(e *events.GuildMessageCreate) {
 		}
 		forwarderClient.Close(h.ctx)
 
-		if err := h.saveMessageMapping(tx, e.Message.ChannelID, e.MessageID, webhookMessage.ChannelID, webhookMessage.ID); err != nil {
+		if err := saveMessageMapping(h.ctx, tx, e.Message.ChannelID, e.MessageID, webhookMessage.ChannelID, webhookMessage.ID); err != nil {
 			e.Client().Logger().Error("failed to save message mapping", "error", err)
 		}
 	}
@@ -348,15 +494,16 @@ func (h *Handler) onMessageUpdate(e *events.GuildMessageUpdate) {
 		return
 	}
 
-	targetChannels, ok := h.cfg[e.ChannelID]
-	if !ok {
+	targetChannels, err := loadRelatedChannels(h.ctx, h.db, e.ChannelID)
+	if err != nil {
+		e.Client().Logger().Error("failed to load related channels", "error", err)
 		return
 	}
 
 	contentCommonFooter, _, _ := h.processMessageAttachments(e.GenericGuildMessage, true)
 
 	for _, targetChannelID := range targetChannels {
-		relatedMessageID, err := h.loadRelatedMessageID(targetChannelID, e.MessageID)
+		relatedMessageID, err := loadRelatedMessageID(h.ctx, h.db, targetChannelID, e.MessageID)
 		if err != nil {
 			e.Client().Logger().Error("failed to fetch related message ID for update", "error", err)
 			continue
@@ -397,13 +544,14 @@ func (h *Handler) onMessageDelete(e *events.GuildMessageDelete) {
 		return
 	}
 
-	targetChannels, ok := h.cfg[e.ChannelID]
-	if !ok {
+	targetChannels, err := loadRelatedChannels(h.ctx, h.db, e.ChannelID)
+	if err != nil {
+		e.Client().Logger().Error("failed to load related channels", "error", err)
 		return
 	}
 
 	for _, targetChannelID := range targetChannels {
-		relatedMessageID, err := h.loadRelatedMessageID(targetChannelID, e.MessageID)
+		relatedMessageID, err := loadRelatedMessageID(h.ctx, h.db, targetChannelID, e.MessageID)
 		if err != nil {
 			e.Client().Logger().Error("failed to fetch related message ID for deletion", "error", err)
 			continue
@@ -431,19 +579,7 @@ func main() {
 	ctx := context.Background()
 	handler := Handler{ctx: ctx}
 
-	cfgPath := "config.json"
-	if len(os.Args) >= 2 {
-		cfgPath = os.Args[1]
-	} else if path := os.Getenv("BRIDGE_BOT_CONFIG"); path != "" {
-		cfgPath = path
-	}
-
-	slog.Info("reading config...")
-
-	if err := loadConfig(&handler.cfg, cfgPath); err != nil {
-		slog.Error("failed to load config", "error", err)
-		return
-	}
+	slog.Info("initializating database...")
 
 	if err := handler.initDB("messages.db"); err != nil {
 		slog.Error("failed to initialize database", "error", err)
@@ -460,6 +596,7 @@ func main() {
 				gateway.IntentMessageContent,
 			),
 		),
+		bot.WithEventListenerFunc(handler.onCommandInteractionCreate),
 		bot.WithEventListenerFunc(handler.onMessageCreate),
 		bot.WithEventListenerFunc(handler.onMessageUpdate),
 		bot.WithEventListenerFunc(handler.onMessageDelete),
@@ -478,6 +615,8 @@ func main() {
 		slog.Error("failed to open gateway", "error", err)
 		return
 	}
+
+	handler.initCommands(client.ApplicationID())
 
 	slog.Info("listening...")
 
