@@ -188,14 +188,12 @@ func (h *Handler) tryWriteReferenceHeader(w *strings.Builder, targetGuildID, tar
 		return nil
 	}
 
-	referredMsgID := optionToTypeOrZero(msgRef.MessageID)
-
-	relatedMsgID, err := h.loadDirelatedMessageID(targetChannelID, referredMsgID)
+	relatedMsgID, err := h.loadDirelatedMessageID(targetChannelID, *msgRef.MessageID)
 	if err != nil {
 		return err
 	}
 
-	referredMsg, err := h.rest.GetMessage(optionToTypeOrZero(msgRef.ChannelID), referredMsgID)
+	referredMsg, err := h.rest.GetMessage(*msgRef.ChannelID, *msgRef.MessageID)
 	if err != nil {
 		return err
 	}
@@ -209,7 +207,7 @@ func (h *Handler) tryWriteReferenceHeader(w *strings.Builder, targetGuildID, tar
 	cutIndicator := ""
 	referredMsgPreviewWindow := nthRune(referredMsgPreview, 128)
 	if referredMsgPreviewWindow < len(referredMsgPreview) {
-		cutIndicator = " <...>"
+		cutIndicator = " **. . .**"
 		referredMsgPreview = referredMsgPreview[:referredMsgPreviewWindow]
 
 		lastSpace := strings.LastIndexFunc(referredMsgPreview, unicode.IsSpace)
@@ -219,7 +217,7 @@ func (h *Handler) tryWriteReferenceHeader(w *strings.Builder, targetGuildID, tar
 	}
 	referredMsgPreview = strings.TrimRightFunc(referredMsgPreview, unicode.IsSpace)
 
-	w.WriteString("-# https://discord.com/channels/")
+	w.WriteString("-# ↵ https://discord.com/channels/")
 	w.WriteString(targetGuildID.String())
 	w.WriteByte('/')
 	w.WriteString(targetChannelID.String())
@@ -230,7 +228,7 @@ func (h *Handler) tryWriteReferenceHeader(w *strings.Builder, targetGuildID, tar
 	w.WriteString(">)\n-# > ")
 	w.WriteString(referredMsgPreview)
 	w.WriteString(cutIndicator)
-	w.WriteString("\n-# ---\n")
+	w.WriteByte('\n')
 
 	return nil
 }
