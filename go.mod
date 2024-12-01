@@ -1,4 +1,4 @@
-module mod
+module github.com/mandriota/bridge-discord-bot
 
 go 1.23.3
 
