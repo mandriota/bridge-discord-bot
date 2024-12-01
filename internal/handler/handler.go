@@ -18,7 +18,7 @@ import (
 	"github.com/disgoorg/json"
 	"github.com/disgoorg/snowflake/v2"
 	"github.com/mandriota/bridge-discord-bot/internal/config"
-	"github.com/mandriota/bridge-discord-bot/internal/dbqueries"
+	"github.com/mandriota/bridge-discord-bot/internal/repository/dbqueries"
 	"github.com/mandriota/bridge-discord-bot/internal/repository"
 	"github.com/mandriota/bridge-discord-bot/internal/texts"
 )
