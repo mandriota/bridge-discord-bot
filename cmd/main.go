@@ -9,68 +9,36 @@ import (
 
 	"github.com/disgoorg/disgo"
 	"github.com/disgoorg/disgo/bot"
-	"github.com/disgoorg/disgo/discord"
 	"github.com/disgoorg/disgo/gateway"
-	"github.com/disgoorg/json"
+	"github.com/mandriota/bridge-discord-bot/internal/config"
 	"github.com/mandriota/bridge-discord-bot/internal/handler"
 	"github.com/mandriota/bridge-discord-bot/internal/repository"
 	_ "github.com/mattn/go-sqlite3"
 )
 
-var (
-	commands = []discord.ApplicationCommandCreate{
-		discord.SlashCommandCreate{
-			Name:        "link",
-			Description: "links current channel to virtual channel",
-			Options: []discord.ApplicationCommandOption{
-				discord.ApplicationCommandOptionString{
-					Name:        "virtual_channel_key",
-					Description: "virtual channel key to link to",
-					Required:    true,
-				},
-				discord.ApplicationCommandOptionString{
-					Name:        "note",
-					Description: "note about virtual channel",
-				},
-			},
-			DefaultMemberPermissions: json.NewNullablePtr(discord.PermissionManageChannels),
-			Contexts: []discord.InteractionContextType{discord.InteractionContextTypeGuild},
-		},
-		discord.SlashCommandCreate{
-			Name:        "unlink",
-			Description: "unlinks current channel from virtual channel",
-			Options: []discord.ApplicationCommandOption{
-				discord.ApplicationCommandOptionString{
-					Name:        "virtual_channel_key",
-					Description: "virtual channel key to unlink from",
-					Required:    true,
-				},
-			},
-		},
-		discord.SlashCommandCreate{
-			Name:        "unlink_all",
-			Description: "unlinks current channel from all virtual channels",
-		},
-		discord.SlashCommandCreate{
-			Name:        "list",
-			Description: "list virtual channels linked to current channel",
-		},
-	}
-)
-
 func main() {
 	ctx := context.Background()
-	handler := handler.Handler{Ctx: ctx}
+	cfg := config.Config{
+		DBPath:            "messages.db",
+		BotToken:          os.Getenv("BRIDGE_BOT_TOKEN"),
+		ForwarderHookName: "Bridge",
+		MaxAttachmentSize: (1 << 20) * 10,
+	}
+	
+	eh := handler.EventHandler{
+		Ctx: ctx,
+		Cfg: cfg,
+	}
 
 	slog.Info("initializating database...")
 
-	if err := repository.InitDB(ctx, &handler.DB, "messages.db"); err != nil {
+	if err := repository.InitDB(ctx, &eh.DB, cfg.DBPath); err != nil {
 		slog.Error("failed to initialize database", "error", err)
 		return
 	}
-	defer handler.DB.Close()
+	defer eh.DB.Close()
 
-	client, err := disgo.New(os.Getenv("BRIDGE_BOT_TOKEN"),
+	client, err := disgo.New(cfg.BotToken,
 		bot.WithGatewayConfigOpts(
 			gateway.WithIntents(
 				gateway.IntentGuilds,
@@ -79,10 +47,10 @@ func main() {
 				gateway.IntentMessageContent,
 			),
 		),
-		bot.WithEventListenerFunc(handler.OnCommandInteractionCreate),
-		bot.WithEventListenerFunc(handler.OnGuildMessageCreate),
-		bot.WithEventListenerFunc(handler.OnGuildMessageUpdate),
-		bot.WithEventListenerFunc(handler.OnGuildMessageDelete),
+		bot.WithEventListenerFunc(eh.OnCommandInteractionCreate),
+		bot.WithEventListenerFunc(eh.OnGuildMessageCreate),
+		bot.WithEventListenerFunc(eh.OnGuildMessageUpdate),
+		bot.WithEventListenerFunc(eh.OnGuildMessageDelete),
 	)
 	if err != nil {
 		slog.Error("failed to create client", "error", err)
@@ -90,7 +58,7 @@ func main() {
 	}
 	defer client.Close(ctx)
 
-	handler.Rest = client.Rest()
+	eh.Rest = client.Rest()
 
 	slog.Info("opening gateway...")
 
@@ -99,7 +67,7 @@ func main() {
 		return
 	}
 
-	client.Rest().SetGlobalCommands(client.ApplicationID(), commands)
+	eh.InitCommands(client.ApplicationID())
 
 	slog.Info("listening...")
 

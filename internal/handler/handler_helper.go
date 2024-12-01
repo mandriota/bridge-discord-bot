@@ -1,15 +1,52 @@
 package handler
 
 import (
+	"io"
+	"net/http"
+	"strings"
+
 	"github.com/disgoorg/disgo/bot"
 	"github.com/disgoorg/disgo/discord"
 	"github.com/disgoorg/disgo/events"
 	"github.com/disgoorg/snowflake/v2"
+	"github.com/mandriota/bridge-discord-bot/internal/config"
 )
 
-const ForwarderHookName = "ForwarderHook"
+func processMessageAttachments(cfg *config.Config, e *events.GenericGuildMessage, onlyFooter bool) (footer string, attach []uint8, bodies [][]byte) {
+	contentCommonFooter := strings.Builder{}
+	contentCommonFileAttach := []uint8{}
+	contentCommonFileBodies := [][]byte{}
 
-func loadOrCreateWebhook(client bot.Client, channelID snowflake.ID) (*discord.IncomingWebhook, error) {
+	for i, attach := range e.Message.Attachments {
+		if attach.Size > cfg.MaxAttachmentSize {
+			contentCommonFooter.WriteByte('\n')
+			contentCommonFooter.WriteString(attach.URL)
+			continue
+		}
+
+		if onlyFooter {
+			continue
+		}
+
+		resp, err := http.Get(attach.URL)
+		if err != nil {
+			e.Client().Logger().Error("failed to download attachment", "error", err)
+			continue
+		}
+
+		text, err := io.ReadAll(resp.Body)
+		if err != nil {
+			e.Client().Logger().Error("failed to download attachment", "error", err)
+		} else {
+			contentCommonFileBodies = append(contentCommonFileBodies, text)
+			contentCommonFileAttach = append(contentCommonFileAttach, uint8(i))
+		}
+		resp.Body.Close()
+	}
+	return contentCommonFooter.String(), contentCommonFileAttach, contentCommonFileBodies
+}
+
+func loadOrCreateWebhook(cfg *config.Config, client bot.Client, channelID snowflake.ID) (*discord.IncomingWebhook, error) {
 	webhooks, err := client.Rest().GetWebhooks(channelID)
 	if err != nil {
 		return nil, err
@@ -22,7 +59,7 @@ func loadOrCreateWebhook(client bot.Client, channelID snowflake.ID) (*discord.In
 	}
 
 	return client.Rest().CreateWebhook(channelID, discord.WebhookCreate{
-		Name: ForwarderHookName,
+		Name: cfg.ForwarderHookName,
 	})
 }
 

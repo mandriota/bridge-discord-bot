@@ -7,8 +7,6 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
 	"sync"
 	"unicode"
@@ -19,22 +17,24 @@ import (
 	"github.com/disgoorg/disgo/webhook"
 	"github.com/disgoorg/json"
 	"github.com/disgoorg/snowflake/v2"
+	"github.com/mandriota/bridge-discord-bot/internal/config"
 	"github.com/mandriota/bridge-discord-bot/internal/dbqueries"
 	"github.com/mandriota/bridge-discord-bot/internal/repository"
 	"github.com/mandriota/bridge-discord-bot/internal/texts"
 )
 
-type Handler struct {
+type EventHandler struct {
 	Ctx context.Context
+	Cfg config.Config
 
 	Rest           rest.Rest
 	DB             *sql.DB
 	recentDelCache sync.Map
 }
 
-const MaxAttachmentDownloadSize = (1 << 20) * 10
+//=:handler:messages
 
-func (h *Handler) tryWriteReferenceHeader(w *strings.Builder, targetGuildID, targetChannelID snowflake.ID, msgRef *discord.MessageReference) error {
+func (h *EventHandler) tryWriteReferenceHeader(w *strings.Builder, targetGuildID, targetChannelID snowflake.ID, msgRef *discord.MessageReference) error {
 	if msgRef == nil {
 		return nil
 	}
@@ -84,43 +84,7 @@ func (h *Handler) tryWriteReferenceHeader(w *strings.Builder, targetGuildID, tar
 	return nil
 }
 
-func (h *Handler) processMessageAttachments(e *events.GenericGuildMessage, onlyFooter bool) (footer string, attach []uint8, bodies [][]byte) {
-	contentCommonFooter := strings.Builder{}
-	contentCommonFileAttach := []uint8{}
-	contentCommonFileBodies := [][]byte{}
-
-	for i, attach := range e.Message.Attachments {
-		if attach.Size > MaxAttachmentDownloadSize {
-			contentCommonFooter.WriteByte('\n')
-			contentCommonFooter.WriteString(attach.URL)
-			continue
-		}
-
-		if onlyFooter {
-			continue
-		}
-
-		resp, err := http.Get(attach.URL)
-		if err != nil {
-			e.Client().Logger().Error("failed to download attachment", "error", err)
-			continue
-		}
-
-		text, err := io.ReadAll(resp.Body)
-		if err != nil {
-			e.Client().Logger().Error("failed to download attachment", "error", err)
-		} else {
-			contentCommonFileBodies = append(contentCommonFileBodies, text)
-			contentCommonFileAttach = append(contentCommonFileAttach, uint8(i))
-		}
-		resp.Body.Close()
-	}
-	return contentCommonFooter.String(), contentCommonFileAttach, contentCommonFileBodies
-}
-
-//=:handler:messages
-
-func (h *Handler) OnGuildMessageCreate(e *events.GuildMessageCreate) {
+func (h *EventHandler) OnGuildMessageCreate(e *events.GuildMessageCreate) {
 	if e.Message.Author.Bot {
 		return
 	}
@@ -142,10 +106,10 @@ func (h *Handler) OnGuildMessageCreate(e *events.GuildMessageCreate) {
 		e.Client().Logger().Error("failed to save author mapping", "error", err)
 	}
 
-	contentCommonFooter, contentCommonFileAttach, contentCommonFileBodies := h.processMessageAttachments(e.GenericGuildMessage, false)
+	contentCommonFooter, contentCommonFileAttach, contentCommonFileBodies := processMessageAttachments(&h.Cfg, e.GenericGuildMessage, false)
 
 	for _, targetChannelID := range targetChannels {
-		forwarderWebhook, err := loadOrCreateWebhook(e.Client(), targetChannelID)
+		forwarderWebhook, err := loadOrCreateWebhook(&h.Cfg, e.Client(), targetChannelID)
 		if err != nil {
 			e.Client().Logger().Error("failed to get/create webhook", "error", err)
 			continue
@@ -201,7 +165,7 @@ func (h *Handler) OnGuildMessageCreate(e *events.GuildMessageCreate) {
 	}
 }
 
-func (h *Handler) OnGuildMessageUpdate(e *events.GuildMessageUpdate) {
+func (h *EventHandler) OnGuildMessageUpdate(e *events.GuildMessageUpdate) {
 	if e.Message.Author.Bot {
 		return
 	}
@@ -212,7 +176,7 @@ func (h *Handler) OnGuildMessageUpdate(e *events.GuildMessageUpdate) {
 		return
 	}
 
-	contentCommonFooter, _, _ := h.processMessageAttachments(e.GenericGuildMessage, true)
+	contentCommonFooter, _, _ := processMessageAttachments(&h.Cfg, e.GenericGuildMessage, true)
 
 	for _, targetChannelID := range targetChannels {
 		relatedMessageID, err := repository.LoadRelatedMessageID(h.Ctx, h.DB, targetChannelID, e.MessageID)
@@ -221,7 +185,7 @@ func (h *Handler) OnGuildMessageUpdate(e *events.GuildMessageUpdate) {
 			continue
 		}
 
-		forwarderWebhook, err := loadOrCreateWebhook(e.Client(), targetChannelID)
+		forwarderWebhook, err := loadOrCreateWebhook(&h.Cfg, e.Client(), targetChannelID)
 		if err != nil {
 			e.Client().Logger().Error("failed to load or create webhook", "error", err)
 			continue
@@ -247,7 +211,7 @@ func (h *Handler) OnGuildMessageUpdate(e *events.GuildMessageUpdate) {
 	}
 }
 
-func (h *Handler) OnGuildMessageDelete(e *events.GuildMessageDelete) {
+func (h *EventHandler) OnGuildMessageDelete(e *events.GuildMessageDelete) {
 	if e.Message.Author.Bot {
 		return
 	}
@@ -269,7 +233,7 @@ func (h *Handler) OnGuildMessageDelete(e *events.GuildMessageDelete) {
 			continue
 		}
 
-		forwarderWebhook, err := loadOrCreateWebhook(e.Client(), targetChannelID)
+		forwarderWebhook, err := loadOrCreateWebhook(&h.Cfg, e.Client(), targetChannelID)
 		if err != nil {
 			e.Client().Logger().Error("failed to load or create webhook", "error", err)
 			continue
@@ -289,7 +253,7 @@ func (h *Handler) OnGuildMessageDelete(e *events.GuildMessageDelete) {
 
 //=:handler:slash_commands
 
-func (h *Handler) initCommands(appID snowflake.ID) error {
+func (h *EventHandler) InitCommands(appID snowflake.ID) error {
 	commands := []discord.ApplicationCommandCreate{
 		discord.SlashCommandCreate{
 			Name:        "link",
@@ -333,22 +297,7 @@ func (h *Handler) initCommands(appID snowflake.ID) error {
 	return err
 }
 
-func (h *Handler) OnCommandInteractionCreate(e *events.ApplicationCommandInteractionCreate) {
-	commandData := e.SlashCommandInteractionData()
-
-	switch commandData.CommandName() {
-	case "link":
-		h.onCommandInteractionCreateLink(e, commandData)
-	case "unlink":
-		h.onCommandInteractionCreateUnlink(e, commandData)
-	case "unlink_all":
-		h.onCommandInteractionCreateUnlinkAll(e, commandData)
-	case "list":
-		h.onCommandInteractionCreateList(e, commandData)
-	}
-}
-
-func (h *Handler) onCommandInteractionCreateList(e *events.ApplicationCommandInteractionCreate, _ discord.SlashCommandInteractionData) {
+func (h *EventHandler) onCommandInteractionCreateList(e *events.ApplicationCommandInteractionCreate, _ discord.SlashCommandInteractionData) {
 	query, args := dbqueries.BuildSelectVirtualChannelKeyQuery(e.Channel().ID())
 
 	rows, err := h.DB.Query(query, args...)
@@ -387,7 +336,7 @@ func (h *Handler) onCommandInteractionCreateList(e *events.ApplicationCommandInt
 	sendSuccessMessage(e, "Virtual Channels Linked", fmt.Sprintf("Virtual channels linked to this channel:\n%s", sb.String()))
 }
 
-func (h *Handler) onCommandInteractionCreateLink(e *events.ApplicationCommandInteractionCreate, commandData discord.SlashCommandInteractionData) {
+func (h *EventHandler) onCommandInteractionCreateLink(e *events.ApplicationCommandInteractionCreate, commandData discord.SlashCommandInteractionData) {
 	virtualChannelKey := commandData.String("virtual_channel_key")
 	note := commandData.String("note")
 
@@ -405,7 +354,7 @@ func (h *Handler) onCommandInteractionCreateLink(e *events.ApplicationCommandInt
 	sendSuccessMessage(e, "Success", fmt.Sprintf("Channel successfully linked to virtual channel `%s`.", virtualChannelHash))
 }
 
-func (h *Handler) onCommandInteractionCreateUnlink(e *events.ApplicationCommandInteractionCreate, commandData discord.SlashCommandInteractionData) {
+func (h *EventHandler) onCommandInteractionCreateUnlink(e *events.ApplicationCommandInteractionCreate, commandData discord.SlashCommandInteractionData) {
 	virtualChannelKey := commandData.String("virtual_channel_key")
 
 	query, args := dbqueries.BuildDeleteLinkQuery(virtualChannelKey, e.Channel().ID())
@@ -425,7 +374,7 @@ func (h *Handler) onCommandInteractionCreateUnlink(e *events.ApplicationCommandI
 	sendSuccessMessage(e, "Success", fmt.Sprintf("Channel successfully unlinked from virtual channel key `%s`.", virtualChannelKey))
 }
 
-func (h *Handler) onCommandInteractionCreateUnlinkAll(e *events.ApplicationCommandInteractionCreate, _ discord.SlashCommandInteractionData) {
+func (h *EventHandler) onCommandInteractionCreateUnlinkAll(e *events.ApplicationCommandInteractionCreate, _ discord.SlashCommandInteractionData) {
 	query, args := dbqueries.BuildDeleteAllLinksQuery(e.Channel().ID())
 
 	res, err := h.DB.Exec(query, args...)
@@ -442,4 +391,19 @@ func (h *Handler) onCommandInteractionCreateUnlinkAll(e *events.ApplicationComma
 	}
 
 	sendSuccessMessage(e, "Success", fmt.Sprintf("Successfully unlinked %d virtual channel(s) from this channel.", rowsAffected))
+}
+
+func (h *EventHandler) OnCommandInteractionCreate(e *events.ApplicationCommandInteractionCreate) {
+	commandData := e.SlashCommandInteractionData()
+
+	switch commandData.CommandName() {
+	case "link":
+		h.onCommandInteractionCreateLink(e, commandData)
+	case "unlink":
+		h.onCommandInteractionCreateUnlink(e, commandData)
+	case "unlink_all":
+		h.onCommandInteractionCreateUnlinkAll(e, commandData)
+	case "list":
+		h.onCommandInteractionCreateList(e, commandData)
+	}
 }
