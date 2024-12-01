@@ -282,14 +282,20 @@ func (h *EventHandler) InitCommands(appID snowflake.ID) error {
 					Required:    true,
 				},
 			},
+			DefaultMemberPermissions: json.NewNullablePtr(discord.PermissionManageChannels),
+			Contexts:                 []discord.InteractionContextType{discord.InteractionContextTypeGuild},
 		},
 		discord.SlashCommandCreate{
 			Name:        "unlink_all",
 			Description: "unlinks current channel from all virtual channels",
+			DefaultMemberPermissions: json.NewNullablePtr(discord.PermissionManageChannels),
+			Contexts:                 []discord.InteractionContextType{discord.InteractionContextTypeGuild},
 		},
 		discord.SlashCommandCreate{
 			Name:        "list",
 			Description: "list virtual channels linked to current channel",
+			DefaultMemberPermissions: json.NewNullablePtr(discord.PermissionManageChannels),
+			Contexts:                 []discord.InteractionContextType{discord.InteractionContextTypeGuild},
 		},
 	}
 
