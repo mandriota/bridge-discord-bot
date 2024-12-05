@@ -67,6 +67,8 @@ func main() {
 		return
 	}
 
+	slog.Info("initializating commands...")
+
 	eh.InitCommands(client.ApplicationID())
 
 	slog.Info("listening...")
