@@ -17,7 +17,7 @@ echo `go env GOPATH`/bin
 ## Configuration
 Bot token is read from `BRIDGE_BOT_TOKEN` environment variable.
 
-The are 4 slash commands for bot configuration, available in Discord channels:
+There are 4 slash commands for bot configuration, available in Discord channels:
 - `/list` - lists linked virtual channels associated with current channel.
 - `/link` - links current channel to existing virtual channel specified by `virtual_channel_key` parameter or creates a new one. You can provide an optional `note` to simplify management of many virtual channels.
 - `/unlink` - unlinks current channel from virtual channel specified by `virtual_channel_key`.
