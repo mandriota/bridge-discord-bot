@@ -15,20 +15,12 @@ echo `go env GOPATH`/bin
 ```
 
 ## Configuration
-Config location is read in following order:
-1. CLI argument
-2. Environment variable `BRIDGE_BOT_CONFIG`
-3. Default value `config.json`
-
-Configuration file looks like:
-```json
-{
-  "channel-id-a": ["channel-id-b", "channel-id-c", "channel-id-d"],
-  "channel-id-b": ["channel-id-a", "channel-id-c", "channel-id-d"],
-  "channel-id-c": ["channel-id-a", "channel-id-b", "channel-id-d"],
-  "channel-id-d": ["channel-id-a", "channel-id-b", "channel-id-c"]
-}
-```
-
 Bot token is read from `BRIDGE_BOT_TOKEN` environment variable.
 
+The are 4 slash commands for bot configuration, available in Discord channels:
+- `/list` - lists linked virtual channels associated with current channel.
+- `/link` - links current channel to existing virtual channel specified by `virtual_channel_key` parameter or creates a new one. You can provide an optional `note` to simplify management of many virtual channels.
+- `/unlink` - unlinks current channel from virtual channel specified by `virtual_channel_key`.
+- `/unlink_all` - unlinks all virtual channels from current channel.
+
+All commands above require manage channels permission.
