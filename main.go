@@ -42,7 +42,7 @@ func main() {
 	}
 	defer eh.DB.Close()
 
-	httpClient := &http.Client{}
+	httpClient := (*http.Client)(nil)
 
 	if cfg.ProxyURL != "" {
 		parsedProxyURL, err := url.Parse(cfg.ProxyURL)
