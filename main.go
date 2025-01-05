@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -10,6 +12,7 @@ import (
 	"github.com/disgoorg/disgo"
 	"github.com/disgoorg/disgo/bot"
 	"github.com/disgoorg/disgo/gateway"
+	"github.com/disgoorg/disgo/rest"
 	"github.com/mandriota/bridge-discord-bot/internal/config"
 	"github.com/mandriota/bridge-discord-bot/internal/handler"
 	"github.com/mandriota/bridge-discord-bot/internal/repository"
@@ -21,10 +24,11 @@ func main() {
 	cfg := config.Config{
 		DBPath:            "messages.db",
 		BotToken:          os.Getenv("BRIDGE_BOT_TOKEN"),
+		ProxyURL:          os.Getenv("PROXY_URL"),
 		ForwarderHookName: "Bridge",
 		MaxAttachmentSize: (1 << 20) * 10,
 	}
-	
+
 	eh := handler.EventHandler{
 		Ctx: ctx,
 		Cfg: cfg,
@@ -38,7 +42,26 @@ func main() {
 	}
 	defer eh.DB.Close()
 
+	httpClient := &http.Client{}
+
+	if cfg.ProxyURL != "" {
+		parsedProxyURL, err := url.Parse(cfg.ProxyURL)
+		if err != nil {
+			slog.Error("failed to parse proxy URL", "error", err)
+			return
+		}
+
+		httpClient = &http.Client{
+			Transport: &http.Transport{
+			Proxy: http.ProxyURL(parsedProxyURL),
+		},
+		}
+	} else {
+		httpClient = http.DefaultClient
+	}
+
 	client, err := disgo.New(cfg.BotToken,
+		bot.WithRestClientConfigOpts(rest.WithHTTPClient(httpClient)),
 		bot.WithGatewayConfigOpts(
 			gateway.WithIntents(
 				gateway.IntentGuilds,
